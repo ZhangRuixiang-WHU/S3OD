@@ -7,7 +7,7 @@ This repo is the official implementation of paper "S $^3$ OD: Size-unbiased Semi
 ## Introduction
 
 S $^3$ OD is a semi-supervised object detection framework tailed for aerial images object detection.
-
+![demo image](figures/fig_s3od_new.png)
 
 ### Requirements
 - Ubuntu 16.04
@@ -40,12 +40,15 @@ pip install -v -e .
 
 Results on DOTA-v1.5
 
-
+![demo image](figures/tab_res_dota.png)
 
 Results on SODA-A
 
+![demo image](figures/tab_res_sodaa.png)
 
 ### Visualization
+
+![demo image](figures/vis_s3od.png)
 
 <!-- ### Data Preparation
 - Download the COCO dataset
