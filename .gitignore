@@ -11,13 +11,14 @@ __pycache__/
 build
 #lib
 tests
-thirdparty
-thirdparty/
+thirdparty/mmdetection/mmdet.egg-info/
+thirdparty/mmrotate/mmrotate.egg-info/
 
 #develop
 wandb
 data
 data/
+thirdparty/mmdetection/data/
 *.pkl
 *.pkl.json
 *.log.json
