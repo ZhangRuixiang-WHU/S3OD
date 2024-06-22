@@ -9,7 +9,7 @@ __pycache__/
 */__pycache__
 *.egg-info
 build
-#lib
+# lib
 tests
 
 #develop

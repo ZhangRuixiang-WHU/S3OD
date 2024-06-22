@@ -1,6 +1,0 @@
-[submodule "thirdparty/mmdetection"]
-	path = thirdparty/mmdetection
-	url = https://github.com/ZhangRuixiang-WHU/S3OD/tree/master/thirdparty/mmdetection
-[submodule "thirdparty/mmrotate"]
-	path = thirdparty/mmrotate
-	url = https://github.com/ZhangRuixiang-WHU/S3OD/tree/master/thirdparty/mmrotate
