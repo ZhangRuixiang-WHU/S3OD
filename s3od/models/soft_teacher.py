@@ -6,17 +6,17 @@ from mmdet.core import bbox2roi, multi_apply
 from mmrotate.core import rbbox2roi,obb2xyxy
 from mmrotate import ROTATED_DETECTORS, build_detector
 
-from s3od.utils.structure_utils import dict_split, weighted_loss
-from s3od.utils import log_image_with_boxes, log_every_n
+from ssod.utils.structure_utils import dict_split, weighted_loss
+from ssod.utils import log_image_with_boxes, log_every_n
 
 from .multi_stream_detector import MultiSteamDetector
 from .utils import Transform2D, filter_invalid
 
 
 @ROTATED_DETECTORS.register_module()
-class SSOD(MultiSteamDetector):
+class SoftTeacher(MultiSteamDetector):
     def __init__(self, model: dict, train_cfg=None, test_cfg=None):
-        super(SSOD, self).__init__(
+        super(SoftTeacher, self).__init__(
             dict(teacher=build_detector(model), student=build_detector(model)),
             train_cfg=train_cfg,
             test_cfg=test_cfg,
@@ -110,7 +110,21 @@ class SSOD(MultiSteamDetector):
             proposals = student_info["proposals"]
 
         loss.update(
-            self.unsup_rcnn_loss(
+            self.unsup_rcnn_cls_loss(
+                student_info["backbone_feature"],
+                student_info["img_metas"],
+                proposals,
+                pseudo_bboxes,
+                pseudo_labels,
+                teacher_info["transform_matrix"],
+                student_info["transform_matrix"],
+                teacher_info["img_metas"],
+                teacher_info["backbone_feature"],
+                student_info=student_info,
+            )
+        )
+        loss.update(
+            self.unsup_rcnn_reg_loss(
                 student_info["backbone_feature"],
                 student_info["img_metas"],
                 proposals,
@@ -155,12 +169,98 @@ class SSOD(MultiSteamDetector):
             proposal_list = self.student.rpn_head.get_bboxes(
                 *rpn_out, img_metas=img_metas, cfg=proposal_cfg
             )
+            # log_image_with_boxes(
+            #     "rpn",
+            #     student_info["img"][0],
+            #     pseudo_bboxes[0][:, :5],
+            #     bbox_tag="rpn_pseudo_label",
+            #     scores=pseudo_bboxes[0][:, 5],
+            #     interval=50,
+            #     img_norm_cfg=student_info["img_metas"][0]["img_norm_cfg"],
+            # )
             return losses, proposal_list
         else:
             return {}, None
 
+    def unsup_rcnn_cls_loss(
+        self,
+        feat,
+        img_metas,
+        proposal_list,
+        pseudo_bboxes,
+        pseudo_labels,
+        teacher_transMat,
+        student_transMat,
+        teacher_img_metas,
+        teacher_feat,
+        student_info=None,
+        **kwargs,
+    ):
+        gt_bboxes, gt_labels, _ = multi_apply(
+            filter_invalid,
+            [bbox[:, :5] for bbox in pseudo_bboxes],
+            pseudo_labels,
+            [bbox[:, 5] for bbox in pseudo_bboxes],
+            thr=self.train_cfg.cls_pseudo_threshold,
+        )
+        log_every_n(
+            {"rcnn_cls_gt_num": sum([len(bbox) for bbox in gt_bboxes]) / len(gt_bboxes)}
+        )
+        sampling_results = self.get_sampling_result(
+            img_metas,
+            proposal_list,
+            gt_bboxes,
+            gt_labels,
+        )
+        selected_bboxes = [res.bboxes[:, :4] for res in sampling_results]
+        rois = bbox2roi(selected_bboxes)
+        bbox_results = self.student.roi_head._bbox_forward(feat, rois)
+        bbox_targets = self.student.roi_head.bbox_head.get_targets(
+            sampling_results, gt_bboxes, gt_labels, self.student.train_cfg.rcnn
+        )
+        M = self._get_trans_mat(student_transMat, teacher_transMat)
+        aligned_proposals = self._transform_bbox(
+            selected_bboxes,
+            M,
+            [meta["img_shape"] for meta in teacher_img_metas],
+        )
+        with torch.no_grad():
+            _, _scores = self.teacher.roi_head.simple_test_bboxes(
+                teacher_feat,
+                teacher_img_metas,
+                aligned_proposals,
+                None,
+                rescale=False,
+            )
+            bg_score = torch.cat([_score[:, -1] for _score in _scores])
+            assigned_label, _, _, _ = bbox_targets
+            neg_inds = assigned_label == self.student.roi_head.bbox_head.num_classes
+            bbox_targets[1][neg_inds] = bg_score[neg_inds].detach()
+        loss = self.student.roi_head.bbox_head.loss(
+            bbox_results["cls_score"],
+            bbox_results["bbox_pred"],
+            rois,
+            *bbox_targets,
+            reduction_override="none",
+        )
+        loss["loss_cls"] = loss["loss_cls"].sum() / max(bbox_targets[1].sum(), 1.0)
+        loss["loss_bbox"] = loss["loss_bbox"].sum() / max(
+            bbox_targets[1].size()[0], 1.0
+        )
+        # if len(gt_bboxes[0]) > 0:
+        #     log_image_with_boxes(
+        #         "rcnn_cls",
+        #         student_info["img"][0],
+        #         gt_bboxes[0],
+        #         bbox_tag="pseudo_label",
+        #         labels=gt_labels[0],
+        #         class_names=self.CLASSES,
+        #         interval=50,
+        #         img_norm_cfg=student_info["img_metas"][0]["img_norm_cfg"],
+        #     )
+        return loss
 
-    def unsup_rcnn_loss(
+    def unsup_rcnn_reg_loss(
         self,
         feat,
         img_metas,
@@ -174,21 +274,61 @@ class SSOD(MultiSteamDetector):
             filter_invalid,
             [bbox[:, :5] for bbox in pseudo_bboxes],
             pseudo_labels,
-            [bbox[:, 5] for bbox in pseudo_bboxes],
-            thr=self.train_cfg.cls_pseudo_threshold,
+            [-bbox[:, 6:].mean(dim=-1) for bbox in pseudo_bboxes],
+            thr=-self.train_cfg.reg_pseudo_threshold,
         )
         log_every_n(
             {"rcnn_reg_gt_num": sum([len(bbox) for bbox in gt_bboxes]) / len(gt_bboxes)}
         )
-        # loss_bbox = self.student.roi_head.forward_train(
-        #     feat, img_metas, proposal_list, gt_bboxes, gt_labels, **kwargs
-        # )["loss_bbox"]
-        # return {"loss_bbox": loss_bbox}
-        loss = self.student.roi_head.forward_train(
+        loss_bbox = self.student.roi_head.forward_train(
             feat, img_metas, proposal_list, gt_bboxes, gt_labels, **kwargs
-        )
-        return loss
+        )["loss_bbox"]
+        # if len(gt_bboxes[0]) > 0:
+        #     log_image_with_boxes(
+        #         "rcnn_reg",
+        #         student_info["img"][0],
+        #         gt_bboxes[0],
+        #         bbox_tag="pseudo_label",
+        #         labels=gt_labels[0],
+        #         class_names=self.CLASSES,
+        #         interval=50,
+        #         img_norm_cfg=student_info["img_metas"][0]["img_norm_cfg"],
+        #     )
+        return {"loss_bbox": loss_bbox}
 
+    def get_sampling_result(
+        self,
+        img_metas,
+        proposal_list,
+        gt_bboxes,
+        gt_labels,
+        gt_bboxes_ignore=None,
+        **kwargs,
+    ):
+        num_imgs = len(img_metas)
+        if gt_bboxes_ignore is None:
+            gt_bboxes_ignore = [None for _ in range(num_imgs)]
+        sampling_results = []
+        for i in range(num_imgs):
+            gt_hbboxes = obb2xyxy(gt_bboxes[i], 'le90')
+            assign_result = self.student.roi_head.bbox_assigner.assign(
+                proposal_list[i], gt_hbboxes, gt_bboxes_ignore[i], gt_labels[i]
+            )
+            sampling_result = self.student.roi_head.bbox_sampler.sample(
+                assign_result,
+                proposal_list[i],
+                gt_hbboxes,
+                gt_labels[i],
+            )
+            if gt_bboxes[i].numel() == 0:
+                sampling_result.pos_gt_bboxes = gt_bboxes[i].new(
+                    (0, gt_bboxes[0].size(-1))).zero_()
+            else:
+                sampling_result.pos_gt_bboxes = \
+                    gt_bboxes[i][sampling_result.pos_assigned_gt_inds, :]
+
+            sampling_results.append(sampling_result)
+        return sampling_results
 
     @force_fp32(apply_to=["bboxes", "trans_mat"])
     def _transform_bbox(self, bboxes, trans_mat, max_shape):
@@ -268,6 +408,13 @@ class SSOD(MultiSteamDetector):
             )
         )
         det_bboxes = proposal_list
+        hbb_proposal_list = [obb2xyxy(pro[:,0:5], 'le90') for pro in proposal_list]
+        reg_unc = self.compute_uncertainty_with_aug(
+            feat, img_metas, hbb_proposal_list, proposal_label_list
+        )
+        det_bboxes = [
+            torch.cat([bbox, unc], dim=-1) for bbox, unc in zip(det_bboxes, reg_unc)
+        ]
         det_labels = proposal_label_list
         teacher_info["det_bboxes"] = det_bboxes
         teacher_info["det_labels"] = det_labels
@@ -277,6 +424,105 @@ class SSOD(MultiSteamDetector):
         ]
         teacher_info["img_metas"] = img_metas
         return teacher_info
+
+    def compute_uncertainty_with_aug(
+        self, feat, img_metas, proposal_list, proposal_label_list
+    ):
+        auged_proposal_list = self.aug_box(
+            proposal_list, self.train_cfg.jitter_times, self.train_cfg.jitter_scale
+        )
+        # flatten
+        auged_proposal_list = [
+            auged.reshape(-1, auged.shape[-1]) for auged in auged_proposal_list
+        ]
+
+        bboxes, _ = self.teacher.roi_head.simple_test_bboxes(
+            feat,
+            img_metas,
+            auged_proposal_list,
+            None,
+            rescale=False,
+        )
+        reg_channel = max([bbox.shape[-1] for bbox in bboxes]) // 5
+        bboxes = [
+            bbox.reshape(self.train_cfg.jitter_times, -1, bbox.shape[-1])
+            if bbox.numel() > 0
+            else bbox.new_zeros(self.train_cfg.jitter_times, 0, 5 * reg_channel).float()
+            for bbox in bboxes
+        ]
+
+        box_unc = [bbox.std(dim=0) for bbox in bboxes]
+        bboxes = [bbox.mean(dim=0) for bbox in bboxes]
+        # scores = [score.mean(dim=0) for score in scores]
+        if reg_channel != 1:
+            bboxes = [
+                bbox.reshape(bbox.shape[0], reg_channel, 5)[
+                    torch.arange(bbox.shape[0]), label
+                ]
+                for bbox, label in zip(bboxes, proposal_label_list)
+            ]
+            box_unc = [
+                unc.reshape(unc.shape[0], reg_channel, 5)[
+                    torch.arange(unc.shape[0]), label
+                ]
+                for unc, label in zip(box_unc, proposal_label_list)
+            ]
+
+        # box_shape = [(bbox[:, 2:4] - bbox[:, :2]).clamp(min=1.0) for bbox in bboxes]
+        box_shape = [(bbox[:, 2:4]).clamp(min=1.0) for bbox in bboxes]
+        # print('stop')
+        # relative unc
+        box_unc = [
+            unc[:,:2] / wh#[:, None, :].expand(-1, 2, 2).reshape(-1, 5)
+            if wh.numel() > 0
+            else unc
+            for unc, wh in zip(box_unc, box_shape)
+        ]
+        return box_unc
+
+    # @staticmethod
+    # def aug_box(boxes, times=1, frac=0.06):
+    #     def _aug_single(box):
+    #         # random translate
+    #         # TODO: random flip or something
+    #         # box_scale = box[:, 2:4] - box[:, :2]
+    #         # box_scale = (
+    #         #     box_scale.clamp(min=1)[:, None, :].expand(-1, 2, 2).reshape(-1, 4)
+    #         # )
+    #         box_scale = box[:, 2:4]
+    #         aug_scale = box_scale * frac  # [n,4]
+
+    #         offset = (
+    #             torch.randn(times, box.shape[0], 2, device=box.device)
+    #             * aug_scale[None, ...]
+    #         )
+    #         new_box = box.clone()[None, ...].expand(times, box.shape[0], -1)
+    #         return torch.cat(
+    #             [new_box[:, :, :2].clone() + offset, new_box[:, :, 2:]], dim=-1
+    #         )
+
+    #     return [_aug_single(box) for box in boxes]
+    @staticmethod
+    def aug_box(boxes, times=1, frac=0.06):
+        def _aug_single(box):
+            # random translate
+            # TODO: random flip or something
+            box_scale = box[:, 2:4] - box[:, :2]
+            box_scale = (
+                box_scale.clamp(min=1)[:, None, :].expand(-1, 2, 2).reshape(-1, 4)
+            )
+            aug_scale = box_scale * frac  # [n,4]
+
+            offset = (
+                torch.randn(times, box.shape[0], 4, device=box.device)
+                * aug_scale[None, ...]
+            )
+            new_box = box.clone()[None, ...].expand(times, box.shape[0], -1)
+            return torch.cat(
+                [new_box[:, :, :4].clone() + offset, new_box[:, :, 4:]], dim=-1
+            )
+
+        return [_aug_single(box) for box in boxes]
 
     def _load_from_state_dict(
         self,
